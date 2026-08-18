@@ -1,0 +1,13 @@
+# J-Space task-local state
+.jspace/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+.DS_Store
+
+# pi session/task state
+.pi/

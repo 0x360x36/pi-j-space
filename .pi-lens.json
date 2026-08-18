@@ -1,0 +1,7 @@
+{
+  "ignore": [
+    "scripts/*.py",
+    "tests/*.py",
+    ".github/**"
+  ]
+}
