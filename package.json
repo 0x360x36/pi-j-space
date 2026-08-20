@@ -5,21 +5,41 @@
   "type": "module",
   "private": true,
   "license": "Apache-2.0",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extension.ts",
+    "skills/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./extension.ts"
     ]
   },
-  "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.2",
-    "@earendil-works/pi-coding-agent": "^0.84.2",
-    "typebox": "^1.3.7"
+  "scripts": {
+    "check": "tsc --noEmit",
+    "verify": "python3 scripts/verify_suite.py",
+    "test": "python3 -m unittest discover -s tests -v"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
     "@types/node": "^26.0.0",
+    "typebox": "^1.3.7",
     "typescript": "^7.0.2"
   },
   "knip": {
-    "entry": ["extension.ts"]
+    "entry": [
+      "extension.ts"
+    ]
   }
 }
