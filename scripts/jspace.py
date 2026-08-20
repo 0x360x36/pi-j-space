@@ -82,7 +82,7 @@ COVERAGE = re.compile(
     r"random(?:ized)?|files?|modules?|sections?|lines?|scenarios?|environments?|"
     r"platforms?|datasets?|records?|routes?|commands?|branches?|ranges?|including|"
     r"through|up\s+to|Windows|Linux|macOS|Chrome|Firefox|Safari)\b|"
-    r"\b(?:Python|Node(?:\.js)?)\s*\d|\bn\s*[<≤=]\s*\d)",
+    r"\b(?:Python|Node(?:\.js)?)\s*\d|\bn\s*(?:<=|>=|==|[<≤>≥=])\s*\d)",
     re.I,
 )
 
