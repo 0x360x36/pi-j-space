@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -17,34 +17,7 @@ const CONTROLLER = join(ROOT, "scripts", "jspace.py");
 const VERIFIER = join(ROOT, "scripts", "verify_suite.py");
 const SKILL = join(ROOT, "skills", "j-space", "SKILL.md");
 
-type JspaceParams = {
-  action: "seam" | "resume" | "note" | "ship";
-  goal?: string;
-  core?: string;
-  core_slot?: number;
-  next?: string;
-  check?: string;
-  by?: string;
-  open?: string;
-  settled_by?: string;
-  close?: number;
-  file?: string;
-  text?: string;
-};
-
-// python flag name -> tool parameter name (1:1 with jspace.py note flags)
-const NOTE_FLAGS: Array<[string, keyof JspaceParams]> = [
-  ["--goal", "goal"],
-  ["--core", "core"],
-  ["--core-slot", "core_slot"],
-  ["--next", "next"],
-  ["--check", "check"],
-  ["--by", "by"],
-  ["--open", "open"],
-  ["--settled-by", "settled_by"],
-  ["--close", "close"],
-];
-
+// ── Schema (source of truth) ───────────────────────────────────────────────
 const noteSchema = {
   goal: Type.Optional(
     Type.String({ description: "Set what done means (one line)" }),
@@ -85,6 +58,144 @@ const noteSchema = {
   ),
 };
 
+const jspaceSchema = Type.Object({
+  action: StringEnum(["seam", "resume", "note", "ship"] as const, {
+    description: "What the controller should do",
+  }),
+  ...noteSchema,
+  file: Type.Optional(
+    Type.String({
+      description:
+        "ship: path of the outgoing file (relative to the workspace)",
+    }),
+  ),
+  text: Type.Optional(
+    Type.String({
+      description:
+        "ship: outgoing text directly, when there is no file yet (like ship -)",
+    }),
+  ),
+});
+
+type JspaceParams = Static<typeof jspaceSchema>;
+
+// python flag name -> tool parameter name (1:1 with jspace.py note flags)
+const NOTE_FLAGS = [
+  ["--goal", "goal"],
+  ["--core", "core"],
+  ["--core-slot", "core_slot"],
+  ["--next", "next"],
+  ["--check", "check"],
+  ["--by", "by"],
+  ["--open", "open"],
+  ["--settled-by", "settled_by"],
+  ["--close", "close"],
+] as const satisfies ReadonlyArray<[string, keyof JspaceParams]>;
+
+// Strip single leading @ injected by pi's file-mention UX (@path). A real
+// file starting with @ is vanishingly rare and can be passed as ./@file.
+function cleanShipPath(raw: string): string {
+  return raw.trim().replace(/^@/, "");
+}
+
+function pushNoteFlags(args: string[], params: JspaceParams): void {
+  for (const [flag, key] of NOTE_FLAGS) {
+    const value = params[key];
+    if (value !== undefined) args.push(flag, String(value));
+  }
+}
+
+function shipError(text: string) {
+  return {
+    content: [{ type: "text" as const, text }],
+    details: { exitCode: 2 },
+  };
+}
+
+async function withTempFile<T>(
+  content: string,
+  fn: (path: string) => Promise<T>,
+): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), "jspace-"));
+  const tmpFile = join(dir, "outgoing.txt");
+  try {
+    await writeFile(tmpFile, content, "utf8");
+    return await fn(tmpFile);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function execPython(opts: {
+  pi: ExtensionAPI;
+  args: string[];
+  cwd: string;
+  signal?: AbortSignal;
+  timeout?: number;
+}) {
+  const { pi, args, cwd, signal, timeout } = opts;
+  const bins = ["python3", "python"] as const;
+  let lastError: unknown;
+  for (const bin of bins) {
+    try {
+      const res = await pi.exec(bin, args, { cwd, signal, timeout });
+      if (
+        res.code === 127 &&
+        /not found|No such file/i.test(`${res.stderr} ${res.stdout}`)
+      ) {
+        lastError = new Error(`${bin} not found (exit 127)`);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      const msg = String((err as Error)?.message ?? err);
+      if (/ENOENT|not found|spawn/i.test(msg) && bin === "python3") continue;
+      throw err;
+    }
+  }
+  throw lastError ?? new Error("python3/python not found in PATH");
+}
+
+async function runController(opts: {
+  pi: ExtensionAPI;
+  args: string[];
+  ctx: ExtensionContext;
+  signal?: AbortSignal;
+}) {
+  const { pi, args, ctx, signal } = opts;
+  try {
+    const res = await execPython({
+      pi,
+      args,
+      cwd: ctx.cwd,
+      signal,
+      timeout: 30_000,
+    });
+    const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+    return {
+      content: [
+        { type: "text" as const, text: out || `(exit ${res.code}, no output)` },
+      ],
+      details: { exitCode: res.code },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const hint = /python|ENOENT/i.test(msg)
+      ? " — python3/python not found in PATH"
+      : "";
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `CANNOT: ${msg}${hint}. Install python3 or ensure it is in PATH.`,
+        },
+      ],
+      details: { exitCode: 2 },
+    };
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("resources_discover", () => ({
     skillPaths: [SKILL],
@@ -101,31 +212,14 @@ export default function (pi: ExtensionAPI) {
       "goal/core/next/check/open/close), ship (scan a file for inner-register leakage " +
       "before it leaves), resume (full premise + ledger + invariants after a long gap). " +
       "Exit 0 = done; exit 2 = could not do what was asked (the refusal text says why). " +
-      "Needs python3 at runtime.",
+      "Needs python3 (or python) at runtime.",
     promptSnippet:
       "Record or report the J-Space ledger (goal, core hubs, verified, open, next, ship checks)",
     promptGuidelines: [
       "Use jspace with action seam at every seam in the loop pass, and jspace note to record goal/core/check/open/next exactly as the skill modules specify.",
       "Use jspace ship with a file path (or text) to register-check anything about to leave for a person.",
     ],
-    parameters: Type.Object({
-      action: StringEnum(["seam", "resume", "note", "ship"] as const, {
-        description: "What the controller should do",
-      }),
-      ...noteSchema,
-      file: Type.Optional(
-        Type.String({
-          description:
-            "ship: path of the outgoing file (relative to the workspace)",
-        }),
-      ),
-      text: Type.Optional(
-        Type.String({
-          description:
-            "ship: outgoing text directly, when there is no file yet (like ship -)",
-        }),
-      ),
-    }),
+    parameters: jspaceSchema,
     async execute(
       _toolCallId: string,
       params: JspaceParams,
@@ -133,36 +227,30 @@ export default function (pi: ExtensionAPI) {
       _onUpdate,
       ctx: ExtensionContext,
     ) {
-      const args = [CONTROLLER, params.action];
-
-      if (params.action === "note") {
-        for (const [flag, key] of NOTE_FLAGS) {
-          const value = params[key];
-          if (value !== undefined) args.push(flag, String(value));
-        }
-      } else if (
-        params.action === "ship" &&
-        params.text !== undefined &&
-        params.file === undefined
-      ) {
-        // Equivalent of `ship -` (stdin): hand the exact text to the controller
-        // through a throwaway file so no workspace pollution is needed. The temp
-        // file must outlive the python run — await before cleaning up.
-        const dir = await mkdtemp(join(tmpdir(), "jspace-"));
-        const tmpFile = join(dir, "outgoing.txt");
-        await writeFile(tmpFile, params.text, "utf8");
-        args.push(tmpFile);
-        try {
-          const result = await runController(pi, args, ctx, signal);
-          return result;
-        } finally {
-          await rm(dir, { recursive: true, force: true });
-        }
-      } else if (params.action === "ship" && params.file !== undefined) {
-        args.push(params.file.trim().replace(/^@/, ""));
+      if (params.file !== undefined && params.text !== undefined) {
+        return shipError(
+          "NOT RECORDED: ship takes file OR text, not both. Use file for a path or text for inline content.",
+        );
       }
 
-      return runController(pi, args, ctx, signal);
+      const args = [CONTROLLER, params.action];
+
+      if (params.action === "note") pushNoteFlags(args, params);
+
+      if (params.action === "ship" && params.text !== undefined) {
+        return withTempFile(params.text, async (tmpFile) =>
+          runController({ pi, args: [...args, tmpFile], ctx, signal }),
+        );
+      }
+
+      if (params.action === "ship" && params.file !== undefined) {
+        const cleaned = cleanShipPath(params.file);
+        if (!cleaned)
+          return shipError("NOT RECORDED: ship file must not be empty");
+        args.push(cleaned);
+      }
+
+      return runController({ pi, args, ctx, signal });
     },
   });
 
@@ -170,34 +258,24 @@ export default function (pi: ExtensionAPI) {
     description:
       "Run the suite's authoring-time integrity checks (one entry, one premise, nine modules, no version talk)",
     handler: async (_args, ctx) => {
-      const res = await pi.exec("python3", [VERIFIER], { cwd: ROOT });
-      const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-      if (res.code !== 0) {
-        ctx.ui.notify("verify_suite found issues", "error");
-        ctx.ui.setWidget("jspace-verify", out.split("\n").slice(0, 12));
-        return;
+      try {
+        const res = await execPython({ pi, args: [VERIFIER], cwd: ROOT });
+        const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+        if (res.code !== 0) {
+          ctx.ui.notify("verify_suite found issues", "error");
+          ctx.ui.setWidget("jspace-verify", out.split("\n").slice(0, 12));
+          return;
+        }
+        ctx.ui.notify("verify_suite clean", "info");
+        ctx.ui.setWidget("jspace-verify", undefined);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`verify_suite: python not found — ${msg}`, "error");
+        ctx.ui.setWidget("jspace-verify", [
+          `CANNOT: ${msg}`,
+          "Install python3/python and ensure it is in PATH.",
+        ]);
       }
-      ctx.ui.notify("verify_suite clean", "info");
     },
   });
-}
-
-async function runController(
-  pi: ExtensionAPI,
-  args: string[],
-  ctx: ExtensionContext,
-  signal: AbortSignal | undefined,
-) {
-  const res = await pi.exec("python3", args, {
-    cwd: ctx.cwd,
-    signal,
-    timeout: 30_000,
-  });
-  const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-  return {
-    content: [
-      { type: "text" as const, text: out || `(exit ${res.code}, no output)` },
-    ],
-    details: { exitCode: res.code },
-  };
 }
